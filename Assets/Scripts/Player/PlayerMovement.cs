@@ -4,10 +4,10 @@ using UnityEngine.InputSystem;
 /// <summary>
 /// Movimiento 2D con Rigidbody2D para Unity 6 (usa linearVelocity y el nuevo Input System).
 /// Incluye: movimiento lateral, salto (coyote + buffer + altura variable),
-/// wall slide / wall jump (las paredes son Ground), y dash apilable con salto
-/// que conserva el momentum en el aire.
+/// wall slide / wall jump (las paredes son Ground), dash apilable con salto
+/// que conserva el momentum en el aire, y subida automática de bordillos (stepping).
 /// </summary>
-[RequireComponent(typeof(Rigidbody2D), typeof(Collider2D))]
+[RequireComponent(typeof(Rigidbody2D))]
 public class PlayerMovement : MonoBehaviour
 {
     [Header("Detección (Layer Ground para suelo y paredes)")]
@@ -47,6 +47,16 @@ public class PlayerMovement : MonoBehaviour
     [Tooltip("Fracción de la velocidad del dash que se conserva al terminar (momentum).")]
     [Range(0f, 1f)] [SerializeField] private float dashExitMomentum = 0.8f;
 
+    [Header("Escalones (stepping)")]
+    [Tooltip("Altura máxima de bordillo que se sube automáticamente.")]
+    [SerializeField] private float maxStepHeight = 0.4f;
+    [Tooltip("Distancia frontal a la que se detecta el bordillo.")]
+    [SerializeField] private float stepCheckDistance = 0.12f;
+    [Tooltip("Velocidad horizontal mínima tras subir (para no perder impulso al chocar).")]
+    [SerializeField] private float stepMinSpeed = 4f;
+    [Tooltip("Duración de la subida del escalón (segundos). Más alto = más suave/lento.")]
+    [SerializeField] private float stepDuration = 0.1f;
+
     [Header("Otros")]
     [SerializeField] private bool flipByScale = true;
 
@@ -54,6 +64,7 @@ public class PlayerMovement : MonoBehaviour
     public bool IsGrounded { get; private set; }
     public bool IsWallSliding { get; private set; }
     public bool IsDashing { get; private set; }
+    public bool IsStepping { get; private set; }
     public int Facing { get; private set; } = 1;
 
     private Rigidbody2D rb;
@@ -83,6 +94,12 @@ public class PlayerMovement : MonoBehaviour
     private int dashDir;
     private int airDashesLeft;
     private bool isJumping;
+
+    // Step suave
+    private int stepDir;
+    private float stepTimer;
+    private float stepStartY;
+    private float stepTargetY;
 
     #region Unity
 
@@ -167,8 +184,19 @@ public class PlayerMovement : MonoBehaviour
         TryStartDash();
         if (IsDashing) return;
 
+        if (IsStepping)
+        {
+            HandleStepClimb(dt);
+            if (IsStepping)
+            {
+                UpdateFacing();
+                return;
+            }
+        }
+
         HandleJump();
         HandleHorizontal(dt);
+        HandleStep();
         HandleGravity();
         UpdateFacing();
     }
@@ -334,13 +362,109 @@ public class PlayerMovement : MonoBehaviour
 
     #endregion
 
+    #region Step up (bordillos)
+
+    private void HandleStep()
+    {
+        if (!IsGrounded || IsDashing || moveInput == 0f) return;
+        if (rb.linearVelocity.y > 0.1f) return;           // no durante un salto
+        if (wallJumpLockTimer > 0f) return;
+
+        const float skin = 0.02f;
+        int dir = (int)moveInput;
+        Bounds b = col.bounds;
+        float feetY = b.min.y;
+        float frontX = b.center.x + dir * (b.extents.x + stepCheckDistance * 0.5f);
+
+        // 1) ¿Hay un obstáculo a la altura de los pies (por debajo del límite)?
+        float lowH = maxStepHeight - skin;
+        bool lowHit = Physics2D.OverlapBox(
+            new Vector2(frontX, feetY + skin + lowH * 0.5f),
+            new Vector2(stepCheckDistance, lowH),
+            0f, groundLayer);
+        if (!lowHit) return;
+
+        // 2) ¿Sigue bloqueado por encima de la altura máxima? Entonces es una pared, no un escalón
+        float highH = b.size.y - maxStepHeight - skin * 2f;
+        if (highH > 0f)
+        {
+            bool highHit = Physics2D.OverlapBox(
+                new Vector2(frontX, feetY + maxStepHeight + skin + highH * 0.5f),
+                new Vector2(stepCheckDistance, highH),
+                0f, groundLayer);
+            if (highHit) return;
+        }
+
+        // 3) Medir la altura real del escalón con un raycast hacia abajo
+        Vector2 origin = new Vector2(
+            b.center.x + dir * (b.extents.x + stepCheckDistance),
+            feetY + maxStepHeight + skin);
+        RaycastHit2D hit = Physics2D.Raycast(origin, Vector2.down, maxStepHeight + skin * 2f, groundLayer);
+        if (!hit.collider) return;
+
+        float stepHeight = hit.point.y - feetY;
+        if (stepHeight <= 0.01f || stepHeight > maxStepHeight) return;
+
+        // 4) ¿Cabe el cuerpo encima del escalón?
+        Vector2 offset = new Vector2(dir * (stepCheckDistance * 0.5f), stepHeight + skin);
+        bool blocked = Physics2D.OverlapBox(
+            (Vector2)b.center + offset,
+            b.size * 0.95f,
+            0f, groundLayer);
+        if (blocked) return;
+
+        // 5) Iniciar la subida suave (sin teletransporte)
+        IsStepping = true;
+        stepDir = dir;
+        stepTimer = 0f;
+        stepStartY = rb.position.y;
+        stepTargetY = rb.position.y + stepHeight + skin;
+        rb.gravityScale = 0f;
+    }
+
+    private void HandleStepClimb(float dt)
+    {
+        // Saltar durante la subida la cancela y deja que el salto normal se ejecute
+        if (jumpBufferTimer > 0f && coyoteTimer > 0f)
+        {
+            EndStepClimb();
+            return;
+        }
+
+        stepTimer += dt;
+        float t = Mathf.Clamp01(stepTimer / Mathf.Max(stepDuration, 0.0001f));
+
+        // Curva suave (ease in-out) hacia la altura objetivo
+        float desiredY = Mathf.Lerp(stepStartY, stepTargetY, Mathf.SmoothStep(0f, 1f, t));
+
+        Vector2 v = rb.linearVelocity;
+        v.x = stepDir * Mathf.Max(Mathf.Abs(v.x), stepMinSpeed);
+        v.y = (desiredY - rb.position.y) / dt;
+        rb.linearVelocity = v;
+
+        if (t >= 1f)
+            EndStepClimb();
+    }
+
+    private void EndStepClimb()
+    {
+        IsStepping = false;
+        rb.gravityScale = baseGravityScale;
+
+        Vector2 v = rb.linearVelocity;
+        v.y = Mathf.Min(v.y, 0f);
+        rb.linearVelocity = v;
+    }
+
+    #endregion
+
     #region Gravedad / Wall slide
 
     private void HandleGravity()
     {
         Vector2 v = rb.linearVelocity;
 
-        IsWallSliding = wallDir != 0 && v.y < 0f && moveInput == wallDir;
+        IsWallSliding = wallDir != 0 && v.y < 0f && moveInput == wallDir && !GroundNearBelow(0.3f);
 
         if (IsWallSliding)
         {
@@ -364,6 +488,13 @@ public class PlayerMovement : MonoBehaviour
         rb.linearVelocity = v;
     }
 
+    private bool GroundNearBelow(float distance)
+    {
+        Bounds b = col.bounds;
+        return Physics2D.BoxCast(b.center, new Vector2(b.size.x * 0.9f, b.size.y),
+                                0f, Vector2.down, distance, groundLayer);
+    }
+
     #endregion
 
     #region Dash
@@ -382,6 +513,7 @@ public class PlayerMovement : MonoBehaviour
         Facing = dashDir;
 
         IsDashing = true;
+        IsStepping = false;
         IsWallSliding = false;
         dashTimer = dashDuration;
         dashCooldownTimer = dashDuration + dashCooldown;
@@ -465,16 +597,26 @@ public class PlayerMovement : MonoBehaviour
         if (c == null) return;
 
         Bounds b = c.bounds;
+
+        // Suelo
         Gizmos.color = Color.green;
         Gizmos.DrawWireCube(
             new Vector3(b.center.x, b.min.y - groundCheckDistance * 0.5f),
             new Vector3(b.size.x * 0.9f, groundCheckDistance));
 
+        // Paredes
         Gizmos.color = Color.cyan;
         float off = b.extents.x + wallCheckDistance * 0.5f;
         Vector3 size = new Vector3(wallCheckDistance, b.size.y * 0.7f);
         Gizmos.DrawWireCube(new Vector3(b.center.x - off, b.center.y), size);
         Gizmos.DrawWireCube(new Vector3(b.center.x + off, b.center.y), size);
+
+        // Escalones
+        Gizmos.color = Color.yellow;
+        float fx = b.extents.x + stepCheckDistance * 0.5f;
+        Vector3 stepSize = new Vector3(stepCheckDistance, maxStepHeight);
+        Gizmos.DrawWireCube(new Vector3(b.center.x - fx, b.min.y + maxStepHeight * 0.5f), stepSize);
+        Gizmos.DrawWireCube(new Vector3(b.center.x + fx, b.min.y + maxStepHeight * 0.5f), stepSize);
     }
 #endif
 }
