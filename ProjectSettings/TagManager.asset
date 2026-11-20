@@ -38,8 +38,20 @@ TagManager:
   - 
   - 
   m_SortingLayers:
+  - name: Cielo
+    uniqueID: 4186540719
+    locked: 0
+  - name: Arboles
+    uniqueID: 2432569613
+    locked: 0
   - name: Default
     uniqueID: 0
+    locked: 0
+  - name: Sol
+    uniqueID: 3332508367
+    locked: 0
+  - name: Arboles_Delante
+    uniqueID: 64312293
     locked: 0
   m_RenderingLayers:
   - Default
